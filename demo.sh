@@ -19,6 +19,31 @@ err() {
   exit 1
 }
 
+wait_seconds() {
+  local count=${1:-5}
+  for i in {1..$count}
+  do
+    echo "."
+    sleep 1
+  done
+  printf "\n"
+}
+
+case "$OSTYPE" in
+    darwin*)  PLATFORM="OSX" ;;
+    linux*)   PLATFORM="LINUX" ;;
+    bsd*)     PLATFORM="BSD" ;;
+    *)        PLATFORM="UNKNOWN" ;;
+esac
+
+cross_sed() {
+    if [[ "$PLATFORM" == "OSX" || "$PLATFORM" == "BSD" ]]; then
+        sed -i "" "$1" "$2"
+    elif [ "$PLATFORM" == "LINUX" ]; then
+        sed -i "$1" "$2"
+    fi
+}
+
 while (( "$#" )); do
   case "$1" in
     install|uninstall|start)
@@ -89,20 +114,93 @@ command.install() {
   oc apply -f infra -n $cicd_prj
   GITEA_HOSTNAME=$(oc get route gitea -o template --template='{{.spec.host}}' -n $cicd_prj)
 
-  info "Deploying pipeline and tasks to $cicd_prj namespace"
-  oc apply -f tasks -n $cicd_prj
-  sed "s#https://github.com/siamaksade#http://$GITEA_HOSTNAME/gitea#g" pipelines/pipeline-build.yaml | oc apply -f - -n $cicd_prj
-
-  oc apply -f triggers -n $cicd_prj
-
   info "Initiatlizing git repository in Gitea and configuring webhooks"
+  WEBHOOK_URL=$(oc get route pipelines-as-code-controller -n pipelines-as-code -o template --template="{{.spec.host}}"  --ignore-not-found)
+  if [ -z "$WEBHOOK_URL" ]; then 
+      WEBHOOK_URL=$(oc get route pipelines-as-code-controller -n openshift-pipelines -o template --template="{{.spec.host}}")
+  fi
+
   sed "s/@HOSTNAME/$GITEA_HOSTNAME/g" config/gitea-configmap.yaml | oc create -f - -n $cicd_prj
   oc rollout status deployment/gitea -n $cicd_prj
-  oc create -f config/gitea-init-taskrun.yaml -n $cicd_prj
+  sed "s#@webhook-url@#https://$WEBHOOK_URL#g" config/gitea-init-taskrun.yaml | oc create -f - -n $cicd_prj
 
-  sleep 10
+
+  wait_seconds 20
+
+  while oc get taskrun -n $cicd_prj | grep Running >/dev/null 2>/dev/null
+  do
+    echo "waiting for Gitea init..."
+    wait_seconds 5
+  done
+  
+  echo "Waiting for source code to be imported to Gitea..."
+  while true; 
+  do
+    result=$(curl --write-out '%{response_code}' --head --silent --output /dev/null http://$GITEA_HOSTNAME/gitea/spring-petclinic)
+    if [ "$result" == "200" ]; then
+	    break
+    fi
+    wait_seconds 5
+  done
+  
+  wait_seconds 5
+
+  info "Updated pipelinerun values for the demo environment"
+  tmp_dir=$(mktemp -d)
+  pushd $tmp_dir
+  git clone http://$GITEA_HOSTNAME/gitea/spring-petclinic 
+  cd spring-petclinic 
+  git config user.email "openshift-pipelines@redhat.com"
+  git config user.name "openshift-pipelines"
+  cat .tekton/build.yaml | grep -A 2 GIT_REPOSITORY
+  cross_sed "s#https://github.com/siamaksade/spring-petclinic-config#http://$GITEA_HOSTNAME/gitea/spring-petclinic-config#g" .tekton/build.yaml
+  cat .tekton/build.yaml | grep -A 2 GIT_REPOSITORY
+  git status
+  git add .tekton/build.yaml
+  git commit -m "Updated manifests git url"
+  git remote add auth-origin http://gitea:openshift@$GITEA_HOSTNAME/gitea/spring-petclinic
+  git push auth-origin cicd-demo
+  popd
+
+  info "Configuring pipelines-as-code"
+  TASKRUN_NAME=$(oc get taskrun -n $cicd_prj -o jsonpath="{.items[0].metadata.name}")
+  GITEA_TOKEN=$(oc logs $TASKRUN_NAME-pod -n $cicd_prj | grep Token | sed 's/^## Token: \(.*\) ##$/\1/g')
+
+cat << EOF > /tmp/tmp-pac-repository.yaml
+---
+apiVersion: "pipelinesascode.tekton.dev/v1alpha1"
+kind: Repository
+metadata:
+  name: spring-petclinic
+  namespace: $cicd_prj
+spec:
+  url: http://$GITEA_HOSTNAME/gitea/spring-petclinic
+  git_provider:
+    user: "git"
+    url: http://$GITEA_HOSTNAME
+    secret:
+      name: "gitea"
+      key: token
+    webhook_secret:
+      name: "gitea"
+      key: "webhook"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gitea
+  namespace: $cicd_prj
+type: Opaque
+stringData:
+  token: "$GITEA_TOKEN"
+  webhook: ""
+EOF
+  oc apply -f /tmp/tmp-pac-repository.yaml -n $cicd_prj 
+
+  wait_seconds 10
 
   info "Configure Argo CD"
+
   cat << EOF > argo/tmp-argocd-app-patch.yaml
 ---
 apiVersion: argoproj.io/v1alpha1
@@ -131,7 +229,7 @@ EOF
 
   until oc get route argocd-server -n $cicd_prj >/dev/null 2>/dev/null
   do
-    sleep 3
+    wait_seconds 5
   done
 
   info "Grants permissions to ArgoCD instances to manage resources in target namespaces"
@@ -152,11 +250,11 @@ EOF
 
   2) Log into Gitea with username/password: gitea/openshift
 
-  3) Edit a file in the repository and commit to trigger the pipeline
+  3) Edit a file in the repository and commit to trigger the pipeline (alternatively, create a pull-request)
 
   4) Check the pipeline run logs in Dev Console or Tekton CLI:
 
-    \$ tkn pipeline logs petclinic-build -L -f -n $cicd_prj
+    \$ opc pac logs -n $cicd_prj
 
 
   You can find further details at:
@@ -172,7 +270,20 @@ EOF
 }
 
 command.start() {
-  oc create -f runs/pipeline-build-run.yaml -n $cicd_prj
+  GITEA_HOSTNAME=$(oc get route gitea -o template --template='{{.spec.host}}' -n $cicd_prj)
+  info "Pushing a change to http://$GITEA_HOSTNAME/gitea/spring-petclinic-config"
+  tmp_dir=$(mktemp -d)
+  pushd $tmp_dir
+  git clone http://$GITEA_HOSTNAME/gitea/spring-petclinic 
+  cd spring-petclinic 
+  git config user.email "openshift-pipelines@redhat.com"
+  git config user.name "openshift-pipelines"
+  echo "   " >> readme.md
+  git add readme.md
+  git commit -m "Updated readme.md"
+  git remote add auth-origin http://gitea:openshift@$GITEA_HOSTNAME/gitea/spring-petclinic
+  git push auth-origin cicd-demo
+  popd
 }
 
 command.uninstall() {
